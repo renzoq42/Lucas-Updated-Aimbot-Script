@@ -1,0 +1,155 @@
+# rbx_aim_mobile.py — host PC, Python 3.11
+# deps: pip install opencv-python==4.9.0.80 numpy==1.26.4
+# requires: adb (platform-tools 35.0.1) on PATH, device authorized (adb devices)
+
+import cv2, numpy as np, subprocess, time, threading
+import tkinter as tk
+
+ADB = "adb"
+CFG = {
+    "fov": 300,           # px radius around screen center (device pixels)
+    "smooth": 4.0,
+    "min_area": 40,
+    "max_area": 6000,
+    "trigger": True,
+    "tap_cooldown_ms": 180,
+    "white_lo": (0, 0, 200),
+    "white_hi": (180, 40, 255),
+}
+
+running = False
+last_tap = 0.0
+status = None
+dev_w = dev_h = 0
+
+def adb(*args, binary=False):
+    r = subprocess.run([ADB, *args], capture_output=True)
+    return r.stdout if binary else r.stdout.decode(errors="ignore")
+
+def check_device():
+    out = adb("devices")
+    lines = [l for l in out.splitlines()[1:] if l.strip()]
+    return bool(lines) and "\tdevice" in lines[0]
+
+def device_size():
+    out = adb("shell", "wm", "size")
+    # "Physical size: 1080x2400"
+    for line in out.splitlines():
+        if "Physical size" in line:
+            wh = line.split(":")[1].strip().split("x")
+            return int(wh[0]), int(wh[1])
+    return 1080, 2400
+
+def grab():
+    png = adb("exec-out", "screencap", "-p", binary=True)
+    if not png or len(png) < 100:
+        return None
+    arr = np.frombuffer(png, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+def tap(x, y):
+    adb("shell", "input", "tap", str(int(x)), str(int(y)))
+
+def find_target(frame, cx, cy):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(CFG["white_lo"]), np.array(CFG["white_hi"]))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, best_d = None, CFG["fov"] ** 2
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if a < CFG["min_area"] or a > CFG["max_area"]:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        if w / max(h, 1) < 1.2:
+            continue
+        tx = x + w // 2
+        ty = y + h + int(0.018 * dev_h)   # drop to head, scaled by screen
+        d = (tx - cx) ** 2 + (ty - cy) ** 2
+        if d < best_d:
+            best_d, best = d, (tx, ty)
+    return best
+
+def loop():
+    global running, last_tap
+    cx, cy = dev_w // 2, dev_h // 2
+    r = CFG["fov"]
+    while running:
+        frame = grab()
+        if frame is None:
+            time.sleep(0.05); continue
+        tgt = find_target(frame, cx, cy)
+        if tgt:
+            dx, dy = tgt[0] - cx, tgt[1] - cy
+            if abs(dx) + abs(dy) > 2:
+                # drag-style aim: small swipe from center toward target
+                sx = cx + int(dx / CFG["smooth"])
+                sy = cy + int(dy / CFG["smooth"])
+                adb("shell", "input", "swipe", str(cx), str(cy), str(sx), str(sy), "40")
+            if CFG["trigger"] and abs(dx) < 8 and abs(dy) < 8:
+                now = time.time() * 1000
+                if now - last_tap > CFG["tap_cooldown_ms"]:
+                    tap(cx, cy)
+                    last_tap = now
+        time.sleep(0.02)
+
+def start():
+    global running, dev_w, dev_h, th
+    if running: return
+    if not check_device():
+        status.set("NO DEVICE — run: adb devices"); return
+    dev_w, dev_h = device_size()
+    running = True
+    th = threading.Thread(target=loop, daemon=True); th.start()
+    status.set(f"RUNNING {dev_w}x{dev_h}")
+
+def stop():
+    global running
+    running = False
+    status.set("STOPPED")
+
+# ---------- UI ----------
+root = tk.Tk()
+root.title("RBX MOBILE AIM // 7G")
+root.configure(bg="#07070d")
+root.geometry("380x460")
+root.attributes("-topmost", True)
+
+tk.Label(root, text="◤ RBX MOBILE AIM ◢", bg="#07070d", fg="#00e0ff",
+         font=("Consolas", 15, "bold")).pack(pady=8)
+
+def slider(label, key, lo, hi, step=1.0):
+    tk.Label(root, text=label, bg="#07070d", fg="#00e0ff",
+             font=("Consolas", 9), anchor="w").pack(fill="x", padx=16)
+    s = tk.Scale(root, from_=lo, to=hi, resolution=step, orient="horizontal",
+                 bg="#121226", fg="#00e0ff", troughcolor="#03030a",
+                 highlightbackground="#07070d", font=("Consolas", 8),
+                 command=lambda v, k=key: CFG.__setitem__(k, float(v)))
+    s.set(CFG[key]); s.pack(fill="x", padx=16, pady=(0, 4))
+
+slider("FOV (px)", "fov", 80, 600)
+slider("SMOOTH", "smooth", 1.0, 12.0, 0.1)
+slider("MIN AREA", "min_area", 10, 300)
+slider("MAX AREA", "max_area", 500, 12000, 50)
+slider("TAP COOLDOWN (ms)", "tap_cooldown_ms", 50, 500, 10)
+
+trig = tk.BooleanVar(value=True)
+tk.Checkbutton(root, text="AUTO TAP", variable=trig,
+               command=lambda: CFG.__setitem__("trigger", trig.get()),
+               bg="#07070d", fg="#00e0ff", selectcolor="#121226",
+               activebackground="#07070d", activeforeground="#00e0ff",
+               font=("Consolas", 10)).pack(pady=4)
+
+status = tk.StringVar(value="STOPPED")
+tk.Label(root, textvariable=status, bg="#07070d", fg="#ffd400",
+         font=("Consolas", 10, "bold")).pack(pady=2)
+
+bf = tk.Frame(root, bg="#07070d"); bf.pack(pady=6)
+tk.Button(bf, text="START [F1]", command=start, bg="#121226", fg="#00ff9c",
+          font=("Consolas", 10, "bold"), width=12).pack(side="left", padx=4)
+tk.Button(bf, text="STOP [F2]", command=stop, bg="#121226", fg="#ff3b3b",
+          font=("Consolas", 10, "bold"), width=12).pack(side="left", padx=4)
+
+root.bind("<F1>", lambda e: start())
+root.bind("<F2>", lambda e: stop())
+root.mainloop()
